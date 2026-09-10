@@ -1,18 +1,18 @@
-# pi-multi-pass
+# pi-multi-pass (hardened fork)
 
 Multi-subscription extension for [pi](https://github.com/earendil-works/pi-coding-agent) -- use multiple OAuth accounts per provider with automatic rate-limit rotation and project-level affinity.
 
+This fork hardens project trust, custom selector loading, configuration validation and writes, and failover continuation. The npm package is upstream v1.3.0 and is not compatible with current Pi; install this fork from a reviewed commit or tag instead.
+
 ## Install
 
-```bash
-pi install npm:pi-multi-pass
-```
-
-Or via git:
+Install the immutable reviewed tag:
 
 ```bash
-pi install git:github.com/hjanuschka/pi-multi-pass
+pi install git:github.com/kyleboas/pi-multi-pass@hardened-v1.5.1-kyle.1
 ```
+
+Do not substitute the npm package for this fork.
 
 ## Features
 
@@ -120,7 +120,9 @@ Prompt contents are not recorded.
 
 Use `/pool project` to configure per-project subscription affinity. This creates `.pi/multi-pass.json` in your project directory.
 
-When `allowedSubs` is set, multi-pass now treats it as an exact allow-list for this project: active routing, pool membership, and chain traversal are all constrained to those provider names.
+Project configuration is read and written only when Pi reports that the project is trusted. If trust is declined or unresolved, multi-pass ignores the file, uses global configuration, and refuses `/pool project`. Trust the project through Pi before configuring project affinity.
+
+When `allowedSubs` is set, multi-pass treats it as an exact allow-list for this project: active routing, pool membership, and chain traversal are all constrained to those provider names. Project configuration is data-only: it cannot activate custom selector code; a project pool requesting the `custom` strategy is normalized to `round-robin`.
 
 ### Use case: separate work and personal accounts
 
@@ -184,7 +186,7 @@ cd ~/side-project
 1. You're using `openai-codex` and hit a rate limit
 2. Multi-pass detects the error, marks `openai-codex` as exhausted
 3. Switches to `openai-codex-2` (same model ID, different account)
-4. Retries your last prompt automatically
+4. Waits for Pi's built-in retries to finish; if the failed turn then settles, queues a fixed continuation instruction using the existing conversation context instead of resending your prompt
 5. After a 5-minute cooldown, `openai-codex` becomes available again
 
 ### Pool selection strategy
@@ -267,11 +269,11 @@ Point to a JS script that decides which member to try first. The script receives
   "members": ["openai-codex", "openai-codex-2", "openai-codex-3"],
   "enabled": true,
   "strategy": "custom",
-  "selectorScript": "selectors/my-codex-selector.js"
+  "selectorScript": "my-codex-selector.js"
 }
 ```
 
-Script paths are resolved relative to `~/.pi/agent/`. Absolute paths and `~/` paths also work.
+Custom selectors are configured only in the global `~/.pi/agent/multi-pass.json`. Paths are relative to `~/.pi/agent/selectors/`. Absolute paths, `~/` paths, traversal, directories, unsupported extensions, and symlink escapes are rejected. The selector must already exist as a regular `.js`, `.mjs`, or `.cjs` file.
 
 **Selector script interface:**
 
@@ -285,8 +287,8 @@ module.exports = async function select(ctx) {
   // ctx.timestamp:       number    -- current Unix timestamp (ms)
   // ctx.hour:            number    -- current hour (0-23, local time)
   // ctx.day:             string    -- current day of week ("mon".."sun")
-  // ctx.prompt:          string?   -- last user prompt, if available
   //
+  // Prompt content is deliberately not passed to selector scripts.
   // Return: string (provider name), string[] (ordered preference), or undefined (fall back)
 
   // Example: prefer a specific account during business hours
@@ -297,7 +299,7 @@ module.exports = async function select(ctx) {
 };
 ```
 
-If the script throws, returns an invalid provider name, or the file is missing, the pool falls back to round-robin.
+If the script throws, returns an invalid provider name, or fails validation, the pool falls back to round-robin.
 
 ## How chains work
 
@@ -410,7 +412,7 @@ Env entries merge with saved config.
 | File | Scope | Contains |
 |---|---|---|
 | `~/.pi/agent/multi-pass.json` | Global | Subscriptions + pools + chains |
-| `.pi/multi-pass.json` | Project | Pool/chain overrides + sub restrictions |
+| `.pi/multi-pass.json` | Trusted project only | Data-only pool/chain overrides + sub restrictions; no custom selector activation |
 
 ## License
 

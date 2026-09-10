@@ -99,14 +99,27 @@ function formatFailoverExhausted(poolName, currentProvider) {
   return `[pool:${poolName}] Failover exhausted after ${currentProvider}; no eligible target remained in this cascade.`;
 }
 
-const PI_RETRYABLE_STATUSES = new Set([408, 409, 429]);
+const RATE_LIMIT_PATTERNS = [
+  /\busage[ _-]*limit(?:[ _-]*(?:reached|exceeded|exhausted))?\b/i,
+  /\brate[ _-]*limit(?:ed|ing)?\b/i,
+  /\btoo many requests\b/i,
+  /\bquota[ _-]*(?:exceeded|exhausted)\b/i,
+  /\bresource[ _-]*exhausted\b/i,
+];
+const FAILOVER_CONTINUATION_PROMPT =
+  "Continue the interrupted request from the existing conversation context. Do not repeat tool calls or side effects that already completed.";
 
-function piWillRetryTurn(errorMessage) {
+function parseHttpStatus(errorMessage) {
   const leading = errorMessage.match(/^\s*(?:Error:\s*)?(\d{3})\b/);
+  if (leading) return Number(leading[1]);
+  const http = errorMessage.match(/^\s*(?:Error:\s*)?HTTP\s+(\d{3})\b/i);
+  if (http) return Number(http[1]);
   const field = errorMessage.match(/"status"\s*:\s*(\d{3})\b/);
-  const status = leading ? Number(leading[1]) : field ? Number(field[1]) : undefined;
-  if (status === undefined) return true;
-  return status >= 500 || PI_RETRYABLE_STATUSES.has(status);
+  return field ? Number(field[1]) : undefined;
+}
+
+function isRateLimitError(errorMessage) {
+  return parseHttpStatus(errorMessage) === 429 || RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(errorMessage));
 }
 
 class RuntimeHarness {
@@ -123,6 +136,7 @@ class RuntimeHarness {
     this.setModelCalls = [];
     this.cascadeState = null;
     this.suppressNextStartTurn = false;
+    this.safeContinuationPending = false;
 
     for (const pool of config.pools) {
       if (!pool.enabled) continue;
@@ -342,8 +356,9 @@ class RuntimeHarness {
   }
 
   async handleError(errorMessage, currentModel, prompt) {
+    this.safeContinuationPending = false;
     if (!currentModel) return false;
-    if (!/limit|429|too many requests|quota/i.test(errorMessage)) return false;
+    if (!isRateLimitError(errorMessage)) return false;
 
     const pool = this.getPoolForProvider(currentModel.provider);
     if (!pool) return false;
@@ -393,11 +408,19 @@ class RuntimeHarness {
 
     this.notify(formatFailoverTransition(pool.name, currentModel.provider, nextCandidate), "info");
     this.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
-    if (prompt && !piWillRetryTurn(errorMessage)) {
-      this.suppressNextStartTurn = true;
-      this.sendUserMessage(prompt, { deliverAs: "followUp" });
-    }
+    if (prompt) this.safeContinuationPending = true;
     return true;
+  }
+
+  finishSuccessfulTurn() {
+    this.safeContinuationPending = false;
+  }
+
+  settle() {
+    if (!this.safeContinuationPending) return;
+    this.safeContinuationPending = false;
+    this.suppressNextStartTurn = true;
+    this.sendUserMessage(FAILOVER_CONTINUATION_PROMPT);
   }
 
   snapshot() {
@@ -407,6 +430,7 @@ class RuntimeHarness {
       setModelCalls: [...this.setModelCalls],
       sentPrompts: [...this.sentPrompts],
       sentPromptOptions: [...this.sentPromptOptions],
+      safeContinuationPending: this.safeContinuationPending,
       notifications: [...this.notifications],
       statuses: [...this.statuses],
     };
@@ -694,6 +718,32 @@ function runSessionStatusChecks() {
   console.log("session-status checks passed");
 }
 
+function runRateLimitMatcherChecks() {
+  for (const message of [
+    "429 Too Many Requests",
+    "HTTP 429 request rejected",
+    '{"status":429,"message":"try later"}',
+    "usage limit reached",
+    "rate_limit exceeded",
+    "too many requests",
+    "quota exhausted",
+    "RESOURCE_EXHAUSTED",
+  ]) {
+    assert.equal(isRateLimitError(message), true, message);
+  }
+  for (const message of [
+    "provider overloaded",
+    "capacity unavailable",
+    "quota information unavailable",
+    "job 42901 failed",
+    "HTTP 503 service unavailable",
+    "400 limit reached",
+  ]) {
+    assert.equal(isRateLimitError(message), false, message);
+  }
+  console.log("rate-limit matcher checks passed");
+}
+
 async function runReplayDeliveryChecks() {
   const config = createConfig();
   const harness = new RuntimeHarness(config, ["anthropic", "anthropic-2"]);
@@ -707,11 +757,27 @@ async function runReplayDeliveryChecks() {
   );
 
   assert.equal(rotated, true);
-  const snapshot = harness.snapshot();
-  assert.deepEqual(snapshot.sentPrompts, [prompt]);
-  assert.deepEqual(snapshot.sentPromptOptions, [{ deliverAs: "followUp" }]);
+  assert.equal(harness.snapshot().safeContinuationPending, true);
+  assert.deepEqual(harness.snapshot().sentPrompts, []);
 
-  console.log("replay-delivery checks passed");
+  harness.settle();
+  const snapshot = harness.snapshot();
+  assert.deepEqual(snapshot.sentPrompts, [FAILOVER_CONTINUATION_PROMPT]);
+  assert.equal(snapshot.sentPrompts.includes(prompt), false);
+  assert.deepEqual(snapshot.sentPromptOptions, [undefined]);
+
+  const retryHarness = new RuntimeHarness(config, ["anthropic", "anthropic-2"]);
+  retryHarness.startTurn(prompt, { provider: "anthropic", id: "claude-sonnet-4" });
+  assert.equal(await retryHarness.handleError(
+    "429 Too Many Requests",
+    { provider: "anthropic", id: "claude-sonnet-4" },
+    prompt,
+  ), true);
+  retryHarness.finishSuccessfulTurn();
+  retryHarness.settle();
+  assert.deepEqual(retryHarness.snapshot().sentPrompts, []);
+
+  console.log("settled-continuation checks passed");
 }
 
 async function runRetryStartTurnChecks() {
@@ -751,6 +817,7 @@ async function runRetryStartTurnChecks() {
 
 runCoreChecks();
 runSessionStatusChecks();
+runRateLimitMatcherChecks();
 await runReplayDeliveryChecks();
 
 if (process.argv.includes("--retry-start-turn")) {

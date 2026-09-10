@@ -35,15 +35,20 @@
  */
 
 import {
+	chmodSync,
+	constants,
 	copyFileSync,
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	readFileSync,
+	realpathSync,
 	renameSync,
+	statSync,
 	unlinkSync,
 	writeFileSync,
 } from "fs";
-import { dirname, isAbsolute, join } from "path";
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "path";
 import { pathToFileURL } from "url";
 import type {
 	ExtensionAPI,
@@ -53,6 +58,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
 	BorderedLoader,
+	CONFIG_DIR_NAME,
 	DynamicBorder,
 	getAgentDir,
 	keyHint,
@@ -1311,8 +1317,8 @@ async function checkGoogleQuotaAccount(
 	}
 }
 
-function normalizeQuotaAllowedProviderNames(cwd: string): string[] | undefined {
-	const project = loadProjectConfig(cwd);
+function normalizeQuotaAllowedProviderNames(cwd: string, projectTrusted: boolean): string[] | undefined {
+	const project = loadProjectConfig(cwd, projectTrusted);
 	if (!project?.allowedSubs || project.allowedSubs.length === 0) return undefined;
 	const normalized = [...new Set(project.allowedSubs.map((value) => value.trim()).filter(Boolean))];
 	return normalized.length > 0 ? normalized : undefined;
@@ -1322,7 +1328,7 @@ function collectQuotaAccounts(ctx: ExtensionContext): QuotaAccount[] {
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
-	const allowedProviderNames = normalizeQuotaAllowedProviderNames(ctx.cwd);
+	const allowedProviderNames = normalizeQuotaAllowedProviderNames(ctx.cwd, ctx.isProjectTrusted());
 	const allowed = allowedProviderNames ? new Set(allowedProviderNames) : undefined;
 	const seen = new Set<string>();
 	const accounts: QuotaAccount[] = [];
@@ -1497,7 +1503,7 @@ async function showQuotaDetails(
 }
 
 async function handleSubsLimits(ctx: ExtensionCommandContext): Promise<void> {
-	const allowedProviderNames = normalizeQuotaAllowedProviderNames(ctx.cwd);
+	const allowedProviderNames = normalizeQuotaAllowedProviderNames(ctx.cwd, ctx.isProjectTrusted());
 	const accounts = collectQuotaAccounts(ctx);
 	if (accounts.length === 0) {
 		const suffix = allowedProviderNames && allowedProviderNames.length > 0
@@ -1591,8 +1597,6 @@ interface PoolSelectorContext {
 	hour: number;
 	/** Current day of week */
 	day: DayOfWeek;
-	/** Last user prompt, if available */
-	prompt?: string;
 }
 
 /** Function signature a custom selector script must export (default export). */
@@ -1635,8 +1639,8 @@ interface PoolConfig {
 	 *  Only used when strategy is "scheduled". */
 	memberSchedule?: Record<string, MemberSchedule>;
 	/** Path to a JS module exporting a selector function.
-	 *  Only used when strategy is "custom". Resolved relative to the
-	 *  global config directory (~/.pi/agent/). */
+	 *  Only used when strategy is "custom". Must be a relative path to a
+	 *  regular .js/.mjs/.cjs file beneath ~/.pi/agent/selectors/. */
 	selectorScript?: string;
 }
 
@@ -1694,29 +1698,178 @@ function globalConfigPath(): string {
 }
 
 function projectConfigPath(cwd: string): string {
-	return join(cwd, ".pi", "multi-pass.json");
+	return join(cwd, CONFIG_DIR_NAME, "multi-pass.json");
 }
 
 function emptyMultiPassConfig(): MultiPassConfig {
 	return { subscriptions: [], pools: [], chains: [], presets: [] };
 }
 
+const MAX_CONFIG_STRING_LENGTH = 512;
+const MAX_CONFIG_ARRAY_LENGTH = 256;
+const MAX_SUBSCRIPTION_INDEX = 10000;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function boundedString(value: unknown, max = MAX_CONFIG_STRING_LENGTH): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const result = value.trim();
+	return result.length > 0 && result.length <= max ? result : undefined;
+}
+
+function boundedArray(value: unknown): unknown[] | undefined {
+	return Array.isArray(value) ? value.slice(0, MAX_CONFIG_ARRAY_LENGTH) : undefined;
+}
+
+function normalizedBoolean(value: unknown, fallback: boolean): boolean {
+	return typeof value === "boolean" ? value : fallback;
+}
+
+function normalizeSubEntry(raw: unknown): SubEntry | undefined {
+	if (!isRecord(raw)) return undefined;
+	const provider = boundedString(raw.provider);
+	const index = raw.index === undefined ? 0 : raw.index;
+	if (!provider || !SUPPORTED_PROVIDERS.includes(provider)) return undefined;
+	if (typeof index !== "number" || !Number.isInteger(index) || index < 0 || index > MAX_SUBSCRIPTION_INDEX) {
+		return undefined;
+	}
+	const label = raw.label === undefined ? undefined : boundedString(raw.label);
+	return label ? { provider, index, label } : { provider, index };
+}
+
+function normalizeScheduleWindow(raw: unknown): ScheduleWindow | undefined {
+	if (!isRecord(raw)) return undefined;
+	const result: ScheduleWindow = {};
+	const hours = boundedArray(raw.hours);
+	if (hours?.length === 2 && hours.every((hour) => typeof hour === "number" && Number.isInteger(hour) && hour >= 0 && hour <= 23)) {
+		result.hours = [hours[0] as number, hours[1] as number];
+	}
+	const days = boundedArray(raw.days)?.filter(
+		(day): day is DayOfWeek => typeof day === "string" && ALL_DAYS.includes(day as DayOfWeek),
+	);
+	if (days && days.length > 0) result.days = [...new Set(days)];
+	if (isRecord(raw.dateRange)) {
+		const fromValue = boundedString(raw.dateRange.from, 10);
+		const toValue = boundedString(raw.dateRange.to, 10);
+		const from = fromValue && /^\d{4}-\d{2}-\d{2}$/.test(fromValue) ? fromValue : undefined;
+		const to = toValue && /^\d{4}-\d{2}-\d{2}$/.test(toValue) ? toValue : undefined;
+		if (from || to) result.dateRange = { from, to };
+	}
+	return result.hours || result.days || result.dateRange ? result : undefined;
+}
+
+function normalizeMemberSchedule(raw: unknown): MemberSchedule | undefined {
+	if (!isRecord(raw)) return undefined;
+	const result: MemberSchedule = {};
+	if (raw.role === "preferred" || raw.role === "overflow") result.role = raw.role;
+	const windows = boundedArray(raw.windows)?.map(normalizeScheduleWindow).filter(
+		(window): window is ScheduleWindow => Boolean(window),
+	);
+	if (windows && windows.length > 0) result.windows = windows;
+	return result.role || result.windows ? result : undefined;
+}
+
+function normalizePool(raw: unknown, allowCustomSelector: boolean): PoolConfig | undefined {
+	if (!isRecord(raw)) return undefined;
+	const name = boundedString(raw.name);
+	const baseProvider = boundedString(raw.baseProvider);
+	if (!name || !baseProvider || !SUPPORTED_PROVIDERS.includes(baseProvider)) return undefined;
+	const members = boundedArray(raw.members)?.map((member) => boundedString(member)).filter(
+		(member): member is string => Boolean(member) && getBaseProvider(member) === baseProvider,
+	);
+	if (!members || members.length === 0) return undefined;
+	const strategy = raw.strategy === "quota-first" || raw.strategy === "scheduled" ||
+		raw.strategy === "custom" || raw.strategy === "round-robin" ? raw.strategy : undefined;
+	const result: PoolConfig = {
+		name,
+		baseProvider,
+		members: [...new Set(members)],
+		enabled: normalizedBoolean(raw.enabled, true),
+	};
+	if (strategy && (allowCustomSelector || strategy !== "custom")) {
+		result.strategy = strategy;
+	} else if (strategy === "custom") {
+		// Project files are data-only overrides and may not activate global code.
+		result.strategy = "round-robin";
+	}
+	if (isRecord(raw.memberSchedule)) {
+		const schedule: Record<string, MemberSchedule> = {};
+		for (const [member, value] of Object.entries(raw.memberSchedule).slice(0, MAX_CONFIG_ARRAY_LENGTH)) {
+			const normalized = normalizeMemberSchedule(value);
+			if (normalized && result.members.includes(member)) schedule[member] = normalized;
+		}
+		if (Object.keys(schedule).length > 0) result.memberSchedule = schedule;
+	}
+	if (allowCustomSelector) {
+		const selectorScript = boundedString(raw.selectorScript);
+		if (selectorScript) result.selectorScript = selectorScript;
+	}
+	return result;
+}
+
+function normalizeChain(raw: unknown): ChainConfig | undefined {
+	if (!isRecord(raw)) return undefined;
+	const name = boundedString(raw.name);
+	const entries = boundedArray(raw.entries)?.map((entry) => {
+		if (!isRecord(entry)) return undefined;
+		const pool = boundedString(entry.pool);
+		const model = boundedString(entry.model);
+		return pool && model ? { pool, model, enabled: normalizedBoolean(entry.enabled, true) } : undefined;
+	}).filter((entry): entry is ChainEntryConfig => Boolean(entry));
+	if (!name || !entries || entries.length === 0) return undefined;
+	return { name, entries, enabled: normalizedBoolean(raw.enabled, true) };
+}
+
+function normalizePreset(raw: unknown): PresetConfig | undefined {
+	if (!isRecord(raw)) return undefined;
+	const name = boundedString(raw.name);
+	const entries = boundedArray(raw.entries)?.map((entry) => {
+		if (!isRecord(entry)) return undefined;
+		const provider = boundedString(entry.provider);
+		const model = boundedString(entry.model);
+		return provider && model && getBaseProvider(provider)
+			? { provider, model, enabled: normalizedBoolean(entry.enabled, true) }
+			: undefined;
+	}).filter((entry): entry is PresetEntry => Boolean(entry));
+	if (!name || !entries || entries.length === 0) return undefined;
+	return { name, entries, enabled: normalizedBoolean(raw.enabled, true) };
+}
+
 function normalizeMultiPassConfig(raw: unknown): MultiPassConfig {
-	const parsed = raw && typeof raw === "object" ? (raw as Partial<MultiPassConfig>) : {};
+	const parsed = isRecord(raw) ? raw : {};
 	return {
-		subscriptions: Array.isArray(parsed.subscriptions) ? parsed.subscriptions : [],
-		pools: Array.isArray(parsed.pools) ? parsed.pools : [],
-		chains: Array.isArray(parsed.chains) ? parsed.chains : [],
-		presets: Array.isArray(parsed.presets) ? parsed.presets : [],
+		subscriptions: boundedArray(parsed.subscriptions)?.map(normalizeSubEntry).filter(
+			(entry): entry is SubEntry => Boolean(entry),
+		) ?? [],
+		pools: boundedArray(parsed.pools)?.map((pool) => normalizePool(pool, true)).filter(
+			(pool): pool is PoolConfig => Boolean(pool),
+		) ?? [],
+		chains: boundedArray(parsed.chains)?.map(normalizeChain).filter(
+			(chain): chain is ChainConfig => Boolean(chain),
+		) ?? [],
+		presets: boundedArray(parsed.presets)?.map(normalizePreset).filter(
+			(preset): preset is PresetConfig => Boolean(preset),
+		) ?? [],
 	};
 }
 
 function normalizeProjectConfig(raw: unknown): ProjectConfig {
-	const parsed = raw && typeof raw === "object" ? (raw as Partial<ProjectConfig>) : {};
+	const parsed = isRecord(raw) ? raw : {};
 	const config: ProjectConfig = {};
-	if (Array.isArray(parsed.pools)) config.pools = parsed.pools;
-	if (Array.isArray(parsed.chains)) config.chains = parsed.chains;
-	if (Array.isArray(parsed.allowedSubs)) config.allowedSubs = parsed.allowedSubs;
+	const pools = boundedArray(parsed.pools)?.map((pool) => normalizePool(pool, false)).filter(
+		(pool): pool is PoolConfig => Boolean(pool),
+	);
+	const chains = boundedArray(parsed.chains)?.map(normalizeChain).filter(
+		(chain): chain is ChainConfig => Boolean(chain),
+	);
+	const allowedSubs = boundedArray(parsed.allowedSubs)?.map((value) => boundedString(value)).filter(
+		(value): value is string => typeof value === "string" && getBaseProvider(value) !== undefined,
+	);
+	if (pools) config.pools = pools;
+	if (chains) config.chains = chains;
+	if (allowedSubs) config.allowedSubs = [...new Set(allowedSubs)];
 	return config;
 }
 
@@ -1731,7 +1884,8 @@ function loadGlobalConfig(): MultiPassConfig {
 	}
 }
 
-function loadProjectConfig(cwd: string): ProjectConfig | undefined {
+function loadProjectConfig(cwd: string, projectTrusted: boolean): ProjectConfig | undefined {
+	if (projectTrusted !== true) return undefined;
 	const path = projectConfigPath(cwd);
 	if (!existsSync(path)) return undefined;
 	try {
@@ -1773,11 +1927,11 @@ function filterChainsByAvailablePools(chains: ChainConfig[], pools: PoolConfig[]
 		.filter((chain) => chain.entries.length > 0);
 }
 
-function loadEffectiveConfig(cwd: string): EffectiveConfig {
+function loadEffectiveConfig(cwd: string, projectTrusted: boolean): EffectiveConfig {
 	const global = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const mergedSubscriptions = normalizeEntries(mergeConfigs(global, envEntries));
-	const project = loadProjectConfig(cwd);
+	const project = loadProjectConfig(cwd, projectTrusted);
 
 	if (!project) {
 		return {
@@ -1816,19 +1970,34 @@ function saveJsonConfig(path: string, config: unknown): void {
 	const dir = dirname(path);
 	if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
+	let existing = false;
+	try {
+		const existingStat = lstatSync(path);
+		if (existingStat.isSymbolicLink()) throw new Error(`Refusing to write symlink target: ${path}`);
+		existing = true;
+	} catch (error: unknown) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+
 	let backupPath: string | undefined;
-	if (existsSync(path)) {
+	if (existing) {
 		try {
 			JSON.parse(readFileSync(path, "utf-8"));
 		} catch {
 			backupPath = `${path}.invalid-${Date.now()}-${process.pid}.bak`;
-			copyFileSync(path, backupPath);
+			copyFileSync(path, backupPath, constants.COPYFILE_EXCL);
+			chmodSync(backupPath, 0o600);
 		}
 	}
 
 	const temporaryPath = `${path}.tmp-${process.pid}-${Date.now()}`;
 	try {
-		writeFileSync(temporaryPath, JSON.stringify(config, null, 2), "utf-8");
+		writeFileSync(temporaryPath, JSON.stringify(config, null, 2), {
+			encoding: "utf-8",
+			flag: "wx",
+			mode: 0o600,
+		});
+		chmodSync(temporaryPath, 0o600);
 		renameSync(temporaryPath, path);
 	} catch (error) {
 		try {
@@ -1842,12 +2011,23 @@ function saveJsonConfig(path: string, config: unknown): void {
 	}
 }
 
-function saveGlobalConfig(config: MultiPassConfig): void {
-	saveJsonConfig(globalConfigPath(), config);
+function saveProjectConfig(cwd: string, config: ProjectConfig, projectTrusted: boolean): void {
+	if (projectTrusted !== true) {
+		throw new Error("Refusing to write project configuration before project trust is approved");
+	}
+	const configDir = join(cwd, CONFIG_DIR_NAME);
+	try {
+		if (lstatSync(configDir).isSymbolicLink()) {
+			throw new Error(`Refusing to write through symlinked ${CONFIG_DIR_NAME} directory: ${configDir}`);
+		}
+	} catch (error: unknown) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+	saveJsonConfig(projectConfigPath(cwd), config);
 }
 
-function saveProjectConfig(cwd: string, config: ProjectConfig): void {
-	saveJsonConfig(projectConfigPath(cwd), config);
+function saveGlobalConfig(config: MultiPassConfig): void {
+	saveJsonConfig(globalConfigPath(), config);
 }
 
 function getProviderDisplayName(providerName: string, subscriptions: SubEntry[]): string {
@@ -2121,34 +2301,28 @@ function registerSub(pi: ExtensionAPI, entry: SubEntry): void {
 // ==========================================================================
 
 const RATE_LIMIT_PATTERNS = [
-	/usage.?limit/i,
-	/rate.?limit/i,
-	/limit.*reached/i,
-	/too many requests/i,
-	/overloaded/i,
-	/capacity/i,
-	/429/,
-	/quota/i,
+	/\busage[ _-]*limit(?:[ _-]*(?:reached|exceeded|exhausted))?\b/i,
+	/\brate[ _-]*limit(?:ed|ing)?\b/i,
+	/\btoo many requests\b/i,
+	/\bquota[ _-]*(?:exceeded|exhausted)\b/i,
+	/\bresource[ _-]*exhausted\b/i,
 ];
-
-function isRateLimitError(errorMessage: string): boolean {
-	return RATE_LIMIT_PATTERNS.some((p) => p.test(errorMessage));
-}
-
-const PI_RETRYABLE_STATUSES = new Set([408, 409, 429]);
 
 function parseHttpStatus(errorMessage: string): number | undefined {
 	const leading = errorMessage.match(/^\s*(?:Error:\s*)?(\d{3})\b/);
 	if (leading) return Number(leading[1]);
+	const http = errorMessage.match(/^\s*(?:Error:\s*)?HTTP\s+(\d{3})\b/i);
+	if (http) return Number(http[1]);
 	const field = errorMessage.match(/"status"\s*:\s*(\d{3})\b/);
 	return field ? Number(field[1]) : undefined;
 }
 
-function piWillRetryTurn(errorMessage: string): boolean {
-	const status = parseHttpStatus(errorMessage);
-	if (status === undefined) return true;
-	return status >= 500 || PI_RETRYABLE_STATUSES.has(status);
+function isRateLimitError(errorMessage: string): boolean {
+	return parseHttpStatus(errorMessage) === 429 || RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(errorMessage));
 }
+
+const FAILOVER_CONTINUATION_PROMPT =
+	"Continue the interrupted request from the existing conversation context. Do not repeat tool calls or side effects that already completed.";
 
 // ==========================================================================
 // Schedule evaluation helpers
@@ -2271,26 +2445,42 @@ function getScheduledMemberOrder(
 // ==========================================================================
 
 const selectorCache = new Map<string, PoolSelectorFn | null>();
+const SELECTOR_EXTENSIONS = new Set([".js", ".mjs", ".cjs"]);
 
-function resolveSelectorScriptPath(scriptPath: string): string {
-	if (isAbsolute(scriptPath)) return scriptPath;
-	if (scriptPath.startsWith("~/")) {
-		const home = process.env.HOME || process.env.USERPROFILE || "";
-		return join(home, scriptPath.slice(2));
+function pathIsContained(root: string, candidate: string): boolean {
+	const pathFromRoot = relative(root, candidate);
+	return pathFromRoot !== "" && !isAbsolute(pathFromRoot) && pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep}`);
+}
+
+function resolveSelectorScriptPath(scriptPath: string): string | undefined {
+	if (!scriptPath || isAbsolute(scriptPath) || scriptPath.startsWith("~") || scriptPath.includes("\0")) {
+		return undefined;
 	}
-	// Resolve relative to global config directory
-	return join(getAgentDir(), scriptPath);
+	if (scriptPath.split(/[\\/]+/).includes("..")) return undefined;
+	if (!SELECTOR_EXTENSIONS.has(extname(scriptPath).toLowerCase())) return undefined;
+
+	try {
+		const selectorRoot = resolve(getAgentDir(), "selectors");
+		if (lstatSync(selectorRoot).isSymbolicLink()) return undefined;
+		const candidate = resolve(selectorRoot, scriptPath);
+		if (!pathIsContained(selectorRoot, candidate)) return undefined;
+
+		const canonicalRoot = realpathSync(selectorRoot);
+		const canonicalCandidate = realpathSync(candidate);
+		if (!pathIsContained(canonicalRoot, canonicalCandidate)) return undefined;
+		if (!statSync(canonicalCandidate).isFile()) return undefined;
+		return canonicalCandidate;
+	} catch {
+		return undefined;
+	}
 }
 
 async function loadSelectorScript(scriptPath: string): Promise<PoolSelectorFn | null> {
 	const resolved = resolveSelectorScriptPath(scriptPath);
+	if (!resolved) return null;
+
 	const cached = selectorCache.get(resolved);
 	if (cached !== undefined) return cached;
-
-	if (!existsSync(resolved)) {
-		selectorCache.set(resolved, null);
-		return null;
-	}
 
 	try {
 		const mod = await import(pathToFileURL(resolved).href);
@@ -2312,7 +2502,6 @@ async function runCustomSelector(
 	available: string[],
 	currentProvider: string,
 	modelId: string,
-	prompt?: string,
 ): Promise<string | undefined> {
 	if (!pool.selectorScript) return undefined;
 	const fn = await loadSelectorScript(pool.selectorScript);
@@ -2327,7 +2516,6 @@ async function runCustomSelector(
 		timestamp: now.getTime(),
 		hour: now.getHours(),
 		day: getDayOfWeek(now),
-		prompt,
 	};
 
 	try {
@@ -2382,6 +2570,7 @@ class PoolManager {
 	private pi: ExtensionAPI;
 	private cascadeState: FailoverCascadeState | null = null;
 	private suppressNextStartTurn = false;
+	private safeContinuationPending = false;
 	private traceEnabled = false;
 	private routingTrace: RoutingTraceEntry[] = [];
 
@@ -2747,7 +2936,6 @@ class PoolManager {
 		currentModel: Model<Api>,
 		ctx: ExtensionContext,
 		cascade: FailoverCascadeState,
-		lastUserPrompt: string | null,
 	): Promise<void> {
 		const strategy = pool.strategy || "round-robin";
 		if (strategy === "round-robin") return;
@@ -2818,7 +3006,6 @@ class PoolManager {
 					available,
 					currentModel.provider,
 					currentModel.id,
-					lastUserPrompt || undefined,
 				);
 				if (best) {
 					const bestIdx = plan.candidates.findIndex(
@@ -2948,7 +3135,6 @@ class PoolManager {
 			currentModel,
 			ctx,
 			cascade,
-			lastUserPrompt,
 		);
 
 		const continuation = formatFailoverContinuation(plan.candidates[0]);
@@ -3007,17 +3193,26 @@ class PoolManager {
 			: `pool ${nextCandidate.poolName} (${pool.strategy || "round-robin"})`;
 		this.recordTrace(`selected ${nextCandidate.provider} (${nextCandidate.modelId}) via ${route}`);
 
-		if (lastUserPrompt && !piWillRetryTurn(errorMessage)) {
-			this.suppressNextStartTurn = true;
-			this.pi.sendUserMessage(lastUserPrompt, { deliverAs: "followUp" });
-			this.recordTrace("queued follow-up because pi will not retry this error");
-		} else if (piWillRetryTurn(errorMessage)) {
-			this.recordTrace("waiting for pi to retry the turn");
+		if (lastUserPrompt) {
+			this.safeContinuationPending = true;
+			this.recordTrace("waiting for Pi retries to settle before continuing");
 		} else {
-			this.recordTrace("turn cannot be replayed because no prompt was captured");
+			this.recordTrace("turn cannot be continued because no prompt was captured");
 		}
 
 		return true;
+	}
+
+	clearPendingContinuation(): void {
+		this.safeContinuationPending = false;
+	}
+
+	continueAfterSettle(): void {
+		if (!this.safeContinuationPending) return;
+		this.safeContinuationPending = false;
+		this.suppressNextStartTurn = true;
+		this.pi.sendUserMessage(FAILOVER_CONTINUATION_PROMPT);
+		this.recordTrace("started safe continuation after Pi retries settled");
 	}
 
 	getPoolConfigs(): PoolConfig[] {
@@ -3061,8 +3256,8 @@ function formatSubscriptionListLine(
 	return `${subDisplayName(entry)} -- ${formatSubscriptionMeta(entry, config, authStorage)}`;
 }
 
-function normalizeSwitchAllowedProviderNames(cwd: string): string[] | undefined {
-	const project = loadProjectConfig(cwd);
+function normalizeSwitchAllowedProviderNames(cwd: string, projectTrusted: boolean): string[] | undefined {
+	const project = loadProjectConfig(cwd, projectTrusted);
 	if (!project?.allowedSubs || project.allowedSubs.length === 0) return undefined;
 	const normalized = [...new Set(project.allowedSubs.map((value) => value.trim()).filter(Boolean))];
 	return normalized.length > 0 ? normalized : undefined;
@@ -3074,7 +3269,7 @@ function getSwitchableProviderOptions(
 	const config = loadGlobalConfig();
 	const envEntries = parseEnvConfig();
 	const allSubs = normalizeEntries(mergeConfigs(config, envEntries));
-	const allowedProviderNames = normalizeSwitchAllowedProviderNames(ctx.cwd);
+	const allowedProviderNames = normalizeSwitchAllowedProviderNames(ctx.cwd, ctx.isProjectTrusted());
 	const allowed = allowedProviderNames ? new Set(allowedProviderNames) : undefined;
 	const options: Array<{ providerName: string; label: string; description: string }> = [];
 	const seen = new Set<string>();
@@ -3133,7 +3328,7 @@ async function handleSubsSwitch(
 ): Promise<void> {
 	const options = getSwitchableProviderOptions(ctx);
 	if (options.length === 0) {
-		const allowedProviderNames = normalizeSwitchAllowedProviderNames(ctx.cwd);
+		const allowedProviderNames = normalizeSwitchAllowedProviderNames(ctx.cwd, ctx.isProjectTrusted());
 		const suffix = allowedProviderNames && allowedProviderNames.length > 0
 			? ` for this project restriction (${allowedProviderNames.join(", ")})`
 			: "";
@@ -3704,7 +3899,7 @@ function reloadPoolManagerForCurrentProject(
 	ctx: ExtensionCommandContext,
 	poolManager: PoolManager,
 ): void {
-	poolManager.loadPools(loadEffectiveConfig(ctx.cwd).pools);
+	poolManager.loadPools(loadEffectiveConfig(ctx.cwd, ctx.isProjectTrusted()).pools);
 }
 
 function renamePoolReferences(
@@ -3994,16 +4189,17 @@ async function promptForPoolDefinition(
 	if (strategy === "custom") {
 		const scriptPath = await ctx.ui.input(
 			"Selector script path",
-			"e.g. selectors/my-pool.js (relative to ~/.pi/agent/)",
+			"e.g. my-pool.js (relative to ~/.pi/agent/selectors/)",
 		);
 		if (scriptPath?.trim()) {
 			selectorScript = scriptPath.trim();
-			const resolved = resolveSelectorScriptPath(selectorScript);
-			if (!existsSync(resolved)) {
+			if (!resolveSelectorScriptPath(selectorScript)) {
 				ctx.ui.notify(
-					`Warning: script not found at ${resolved}. You can create it later.`,
+					"Selector must be an existing .js, .mjs, or .cjs file contained in ~/.pi/agent/selectors/.",
 					"warning",
 				);
+				selectorScript = undefined;
+				strategy = "round-robin";
 			}
 		} else {
 			ctx.ui.notify("No selector script provided. Pool will fall back to round-robin.", "warning");
@@ -4249,15 +4445,23 @@ async function changePoolStrategy(
 	} else if (nextStrategy === "custom") {
 		const scriptPath = await ctx.ui.input(
 			"Selector script path",
-			"e.g. selectors/my-pool.js (relative to ~/.pi/agent/)",
+			"e.g. my-pool.js (relative to ~/.pi/agent/selectors/)",
 		);
 		if (!scriptPath?.trim()) {
 			ctx.ui.notify("No script path provided. Reverting to round-robin.", "warning");
 			delete pool.strategy;
 			return;
 		}
+		const resolved = resolveSelectorScriptPath(scriptPath.trim());
+		if (!resolved) {
+			ctx.ui.notify(
+				"Selector must be an existing .js, .mjs, or .cjs file contained in ~/.pi/agent/selectors/.",
+				"warning",
+			);
+			return;
+		}
 		pool.selectorScript = scriptPath.trim();
-		selectorCache.delete(resolveSelectorScriptPath(pool.selectorScript));
+		selectorCache.delete(resolved);
 		delete pool.memberSchedule;
 	} else if (nextStrategy === "quota-first") {
 		delete pool.memberSchedule;
@@ -5074,8 +5278,13 @@ async function handlePoolProject(
 	ctx: ExtensionCommandContext,
 	poolManager: PoolManager,
 ): Promise<void> {
+	if (!ctx.isProjectTrusted()) {
+		ctx.ui.notify("multi-pass: project configuration is disabled until this project is trusted.", "warning");
+		return;
+	}
+
 	const projectPath = projectConfigPath(ctx.cwd);
-	const projectConf = loadProjectConfig(ctx.cwd);
+	const projectConf = loadProjectConfig(ctx.cwd, ctx.isProjectTrusted());
 	const globalConf = loadGlobalConfig();
 
 	const hasProjectConfig = projectConf !== undefined;
@@ -5108,8 +5317,8 @@ async function handlePoolProject(
 		);
 		if (!confirmed) return;
 		try {
-			writeFileSync(projectPath, "{}", "utf-8");
-			const effective = loadEffectiveConfig(ctx.cwd);
+			saveProjectConfig(ctx.cwd, {}, ctx.isProjectTrusted());
+			const effective = loadEffectiveConfig(ctx.cwd, ctx.isProjectTrusted());
 			poolManager.loadPools(effective.pools);
 			ctx.ui.notify("Project config cleared. Using global pools.", "info");
 		} catch (err: unknown) {
@@ -5178,9 +5387,9 @@ async function handlePoolProject(
 			...projectConf,
 			allowedSubs: allowed.length > 0 ? allowed : undefined,
 		};
-		saveProjectConfig(ctx.cwd, newProjectConf);
+		saveProjectConfig(ctx.cwd, newProjectConf, ctx.isProjectTrusted());
 
-		const effective = loadEffectiveConfig(ctx.cwd);
+		const effective = loadEffectiveConfig(ctx.cwd, ctx.isProjectTrusted());
 		poolManager.loadPools(effective.pools);
 
 		if (allowed.length > 0) {
@@ -5219,8 +5428,8 @@ async function handlePoolProject(
 		if (selected2 === "[Use global pools (no override)]") {
 			const newProjectConf: ProjectConfig = { ...projectConf };
 			delete newProjectConf.pools;
-			saveProjectConfig(ctx.cwd, newProjectConf);
-			const effective = loadEffectiveConfig(ctx.cwd);
+			saveProjectConfig(ctx.cwd, newProjectConf, ctx.isProjectTrusted());
+			const effective = loadEffectiveConfig(ctx.cwd, ctx.isProjectTrusted());
 			poolManager.loadPools(effective.pools);
 			ctx.ui.notify("Project will use global pools.", "info");
 			return;
@@ -5240,8 +5449,8 @@ async function handlePoolProject(
 		}
 
 		const newProjectConf: ProjectConfig = { ...projectConf, pools: projectPools };
-		saveProjectConfig(ctx.cwd, newProjectConf);
-		const effective = loadEffectiveConfig(ctx.cwd);
+		saveProjectConfig(ctx.cwd, newProjectConf, ctx.isProjectTrusted());
+		const effective = loadEffectiveConfig(ctx.cwd, ctx.isProjectTrusted());
 		poolManager.loadPools(effective.pools);
 
 		const activeNames = projectPools.map((p) => p.name).join(", ") || "none";
@@ -5250,16 +5459,16 @@ async function handlePoolProject(
 	}
 
 	if (action === "info") {
-		const effective = loadEffectiveConfig(ctx.cwd);
+		const effective = loadEffectiveConfig(ctx.cwd, ctx.isProjectTrusted());
 		const lines: string[] = [];
 
-		if (effective.projectConfigPath && loadProjectConfig(ctx.cwd)) {
+		if (effective.projectConfigPath && loadProjectConfig(ctx.cwd, ctx.isProjectTrusted())) {
 			lines.push(`Project config: ${projectPath}`);
 		} else {
 			lines.push("Project config: none (using global)");
 		}
 
-		const pc = loadProjectConfig(ctx.cwd);
+		const pc = loadProjectConfig(ctx.cwd, ctx.isProjectTrusted());
 		if (pc?.allowedSubs && pc.allowedSubs.length > 0) {
 			lines.push(`Allowed subs: ${pc.allowedSubs.join(", ")}`);
 		} else {
@@ -5366,7 +5575,7 @@ async function handlePoolMenu(
 		"remove   -- Remove a pool",
 		"status   -- Detailed pool status with member health",
 		"trace    -- Opt-in routing decision trace",
-		"project  -- Project-level pool config (.pi/multi-pass.json)",
+		`project  -- Project-level pool config (${CONFIG_DIR_NAME}/multi-pass.json)`,
 	];
 
 	const selected = await ctx.ui.select("Pool Manager", actions);
@@ -5760,7 +5969,7 @@ export default function multiSub(pi: ExtensionAPI) {
 		reason: "session" | "model" | "input",
 	): Promise<boolean> => {
 		if (projectRestrictionSwitchInFlight) return true;
-		const effective = loadEffectiveConfig(ctx.cwd);
+		const effective = loadEffectiveConfig(ctx.cwd, ctx.isProjectTrusted());
 		const allowedSummary = formatAllowedProviderSummary(effective);
 		if (!allowedSummary) {
 			return true;
@@ -5796,9 +6005,9 @@ export default function multiSub(pi: ExtensionAPI) {
 		return false;
 	};
 
-	// On session start, reload pools with project-level config
+	// On session start, load project-level config only after Pi trust approval.
 	pi.on("session_start", async (_event, ctx) => {
-		const effective = loadEffectiveConfig(ctx.cwd);
+		const effective = loadEffectiveConfig(ctx.cwd, ctx.isProjectTrusted());
 		poolManager.loadPools(effective.pools);
 
 		const statusParts: string[] = [];
@@ -5847,8 +6056,10 @@ export default function multiSub(pi: ExtensionAPI) {
 		poolManager.startTurn(event.prompt, ctx.model);
 	});
 
-	// Listen for errors to trigger pool rotation
+	// Listen for errors to trigger pool rotation. Any successful or unrelated
+	// terminal turn cancels a pending continuation from an earlier retry.
 	pi.on("agent_end", async (event: AgentEndEvent, ctx: ExtensionContext) => {
+		poolManager.clearPendingContinuation();
 		if (!event.messages || event.messages.length === 0) return;
 
 		const lastMsg = event.messages[event.messages.length - 1];
@@ -5858,7 +6069,7 @@ export default function multiSub(pi: ExtensionAPI) {
 		if (assistantMsg.stopReason !== "error") return;
 		if (!assistantMsg.errorMessage) return;
 
-		const effective = loadEffectiveConfig(ctx.cwd);
+		const effective = loadEffectiveConfig(ctx.cwd, ctx.isProjectTrusted());
 		const rotated = await poolManager.handleError(
 			assistantMsg.errorMessage,
 			ctx.model,
@@ -5889,6 +6100,13 @@ export default function multiSub(pi: ExtensionAPI) {
 				}
 			}
 		}
+	});
+
+	// Pi decides whether to auto-retry only after agent_end handlers finish.
+	// Waiting for agent_settled prevents a continuation from racing or duplicating
+	// a successful built-in retry.
+	pi.on("agent_settled", async () => {
+		poolManager.continueAfterSettle();
 	});
 
 	// Register /subs command
