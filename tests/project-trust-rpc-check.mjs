@@ -11,6 +11,20 @@ const projectDir = mkdtempSync(join(tmpdir(), "pi-multi-pass-untrusted-project-"
 const projectPiDir = join(projectDir, ".pi");
 
 try {
+	writeFileSync(
+		join(agentDir, "multi-pass.json"),
+		JSON.stringify({
+			subscriptions: [],
+			pools: [{
+				name: "global-pool",
+				baseProvider: "openai-codex",
+				members: ["openai-codex"],
+				enabled: true,
+			}],
+			chains: [],
+			presets: [],
+		}),
+	);
 	mkdirSync(projectPiDir);
 	writeFileSync(join(projectPiDir, "settings.json"), "{}\n");
 	writeFileSync(
@@ -54,6 +68,7 @@ try {
 	assert.doesNotMatch(result.stdout, /"type":"extension_error"/, result.stdout);
 	assert.match(result.stdout, /project configuration is disabled until this project is trusted/);
 	assert.doesNotMatch(result.stdout, /openai-codex-999|\.\.\/\.\.\/malicious\.js/);
+	assert.doesNotMatch(result.stdout, /1 pool\(s\)/, "generic pool count must not occupy Pi's status line");
 	console.log("project trust RPC check passed");
 } finally {
 	rmSync(agentDir, { recursive: true, force: true });

@@ -6022,15 +6022,11 @@ export default function multiSub(pi: ExtensionAPI) {
 		const allowedSummary = formatAllowedProviderSummary(effective);
 		if (allowedSummary) {
 			statusParts.push(`allowed ${allowedSummary}`);
-		} else {
-			const poolCount = effective.pools.filter((p) => p.enabled).length;
-			if (poolCount > 0 && !activeChain) {
-				statusParts.push(`${poolCount} pool(s)`);
-			}
 		}
-		if (statusParts.length > 0) {
-			ctx.ui.setStatus("multi-pass", statusParts.join(" | "));
-		}
+		ctx.ui.setStatus(
+			"multi-pass",
+			statusParts.length > 0 ? statusParts.join(" | ") : undefined,
+		);
 
 		await enforceProjectRestriction(ctx, "session");
 	});

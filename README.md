@@ -9,7 +9,7 @@ This fork hardens project trust, custom selector loading, configuration validati
 Install the immutable reviewed tag:
 
 ```bash
-pi install git:github.com/kyleboas/pi-multi-pass@hardened-v1.5.1-kyle.1
+pi install git:github.com/kyleboas/pi-multi-pass@hardened-v1.5.1-kyle.2
 ```
 
 Do not substitute the npm package for this fork.
