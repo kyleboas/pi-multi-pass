@@ -52,11 +52,17 @@ assert.match(source, /copyFileSync\(path, backupPath, constants\.COPYFILE_EXCL\)
 assert.match(source, /renameSync\(temporaryPath, path\)/);
 assert.doesNotMatch(source, /writeFileSync\(projectPath, "\{\}"/);
 
-// Failover uses a fixed continuation and a narrow rate-limit classifier.
+// Failover uses a hidden fixed continuation and a narrow rate-limit classifier.
 assert.match(source, /FAILOVER_CONTINUATION_PROMPT/);
+assert.match(source, /FAILOVER_CONTINUATION_MARKER = "resume"/);
 assert.match(source, /pi\.on\("agent_settled"/);
 assert.match(source, /poolManager\.clearPendingContinuation\(\)/);
-assert.match(source, /sendUserMessage\(FAILOVER_CONTINUATION_PROMPT\)/);
+assert.match(source, /customType: FAILOVER_CONTINUATION_TYPE/);
+assert.match(source, /content: FAILOVER_CONTINUATION_MARKER/);
+assert.match(source, /display: false/);
+assert.match(source, /\{ triggerTurn: true \}/);
+assert.match(source, /pi\.on\("context"/);
+assert.doesNotMatch(source, /sendUserMessage\(FAILOVER_CONTINUATION_PROMPT\)/);
 assert.doesNotMatch(source, /sendUserMessage\(lastUserPrompt/);
 assert.doesNotMatch(source, /function piWillRetryTurn/);
 const matcherBlock = source.slice(source.indexOf("const RATE_LIMIT_PATTERNS"), source.indexOf("// Schedule evaluation helpers"));

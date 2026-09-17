@@ -2321,6 +2321,8 @@ function isRateLimitError(errorMessage: string): boolean {
 	return parseHttpStatus(errorMessage) === 429 || RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(errorMessage));
 }
 
+const FAILOVER_CONTINUATION_TYPE = "multi-pass";
+const FAILOVER_CONTINUATION_MARKER = "resume";
 const FAILOVER_CONTINUATION_PROMPT =
 	"Continue the interrupted request from the existing conversation context. Do not repeat tool calls or side effects that already completed.";
 
@@ -2569,7 +2571,6 @@ class PoolManager {
 	private providerToPool: Map<string, string> = new Map();
 	private pi: ExtensionAPI;
 	private cascadeState: FailoverCascadeState | null = null;
-	private suppressNextStartTurn = false;
 	private safeContinuationPending = false;
 	private traceEnabled = false;
 	private routingTrace: RoutingTraceEntry[] = [];
@@ -2960,10 +2961,6 @@ class PoolManager {
 					if (bestIdx > 0) {
 						const [moved] = plan.candidates.splice(bestIdx, 1);
 						plan.candidates.unshift(moved);
-						ctx.ui.notify(
-							`[pool:${pool.name}] quota-first: ${best} has the most remaining quota`,
-							"info",
-						);
 						this.recordTrace(`${best} ranked first by quota-first in pool ${pool.name}`);
 					}
 				}
@@ -2989,10 +2986,6 @@ class PoolManager {
 
 			const first = ordered[0];
 			if (first) {
-				ctx.ui.notify(
-					`[pool:${pool.name}] scheduled: ${first} selected by schedule priority`,
-					"info",
-				);
 				this.recordTrace(`${first} ranked first by schedule in pool ${pool.name}`);
 			}
 			return;
@@ -3014,10 +3007,6 @@ class PoolManager {
 					if (bestIdx > 0) {
 						const [moved] = plan.candidates.splice(bestIdx, 1);
 						plan.candidates.unshift(moved);
-						ctx.ui.notify(
-							`[pool:${pool.name}] custom: selector chose ${best}`,
-							"info",
-						);
 						this.recordTrace(`${best} ranked first by custom selector in pool ${pool.name}`);
 					}
 				}
@@ -3053,10 +3042,6 @@ class PoolManager {
 	}
 
 	startTurn(prompt: string | null, currentModel?: Model<Api>): void {
-		if (this.suppressNextStartTurn) {
-			this.suppressNextStartTurn = false;
-			return;
-		}
 		if (!prompt) {
 			this.cascadeState = null;
 			return;
@@ -3137,12 +3122,7 @@ class PoolManager {
 			cascade,
 		);
 
-		const continuation = formatFailoverContinuation(plan.candidates[0]);
 		for (const skip of plan.skips) {
-			ctx.ui.notify(
-				`[pool:${skip.poolName}] ${skip.detail}; ${continuation}`,
-				"warning",
-			);
 			this.recordTrace(skip.detail);
 		}
 
@@ -3156,10 +3136,6 @@ class PoolManager {
 
 		const nextModel = ctx.modelRegistry.find(nextCandidate.provider, nextCandidate.modelId);
 		if (!nextModel) {
-			ctx.ui.notify(
-				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} -> ${nextCandidate.modelId} skipped (model missing at runtime); cascade exhausted; no later eligible target`,
-				"warning",
-			);
 			this.recordTrace(`${nextCandidate.provider} skipped because model ${nextCandidate.modelId} is unavailable`);
 			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
 			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
@@ -3168,10 +3144,6 @@ class PoolManager {
 
 		const success = await this.pi.setModel(nextModel);
 		if (!success) {
-			ctx.ui.notify(
-				`[pool:${nextCandidate.poolName}] ${nextCandidate.provider} skipped (authentication unavailable during switch); cascade exhausted; no later eligible target`,
-				"warning",
-			);
 			this.recordTrace(`${nextCandidate.provider} skipped because authentication was unavailable`);
 			ctx.ui.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
 			ctx.ui.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
@@ -3183,10 +3155,6 @@ class PoolManager {
 			cascade.visitedChainIndexes.add(nextCandidate.chainIndex);
 		}
 
-		ctx.ui.notify(
-			formatFailoverTransition(pool.name, currentModel.provider, nextCandidate),
-			"info",
-		);
 		ctx.ui.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
 		const route = nextCandidate.source === "chain"
 			? `chain ${nextCandidate.chainName}#${(nextCandidate.chainIndex ?? 0) + 1}`
@@ -3210,9 +3178,15 @@ class PoolManager {
 	continueAfterSettle(): void {
 		if (!this.safeContinuationPending) return;
 		this.safeContinuationPending = false;
-		this.suppressNextStartTurn = true;
-		this.pi.sendUserMessage(FAILOVER_CONTINUATION_PROMPT);
-		this.recordTrace("started safe continuation after Pi retries settled");
+		this.pi.sendMessage(
+			{
+				customType: FAILOVER_CONTINUATION_TYPE,
+				content: FAILOVER_CONTINUATION_MARKER,
+				display: false,
+			},
+			{ triggerTurn: true },
+		);
+		this.recordTrace("started hidden safe continuation after Pi retries settled");
 	}
 
 	getPoolConfigs(): PoolConfig[] {
@@ -4863,29 +4837,6 @@ function formatFailoverStatus(
 	return `${scope} | active ${formatFailoverTarget(candidate)}`;
 }
 
-function formatFailoverContinuation(
-	nextCandidate: Pick<FailoverCandidate, "provider" | "modelId" | "source" | "poolName" | "chainName" | "chainIndex"> | undefined,
-): string {
-	if (!nextCandidate) {
-		return "cascade exhausted; no later eligible target";
-	}
-	const phase = nextCandidate.source === "chain"
-		? `continuing forward to chain ${nextCandidate.chainName}#${(nextCandidate.chainIndex ?? 0) + 1}`
-		: `continuing within pool ${nextCandidate.poolName}`;
-	return `${phase} -> ${formatFailoverTarget(nextCandidate)}`;
-}
-
-function formatFailoverTransition(
-	poolName: string,
-	currentProvider: string,
-	nextCandidate: Pick<FailoverCandidate, "provider" | "modelId" | "source" | "poolName" | "chainName" | "chainIndex">,
-): string {
-	const phase = nextCandidate.source === "chain"
-		? `advancing to chain ${nextCandidate.chainName}#${(nextCandidate.chainIndex ?? 0) + 1}`
-		: `rotating within pool ${poolName}`;
-	return `[pool:${poolName}] Rate limited on ${currentProvider}; ${phase}; active ${formatFailoverTarget(nextCandidate)}`;
-}
-
 function formatFailoverExhausted(poolName: string, currentProvider: string): string {
 	return `[pool:${poolName}] Failover exhausted after ${currentProvider}; no eligible target remained in this cascade.`;
 }
@@ -6043,10 +5994,27 @@ export default function multiSub(pi: ExtensionAPI) {
 		return ok ? { action: "continue" as const } : { action: "handled" as const };
 	});
 
+	pi.on("context", async (event) => {
+		let changed = false;
+		const messages = event.messages.map((message) => {
+			if (
+				message.role !== "custom" ||
+				message.customType !== FAILOVER_CONTINUATION_TYPE ||
+				message.content !== FAILOVER_CONTINUATION_MARKER
+			) {
+				return message;
+			}
+			changed = true;
+			return { ...message, content: FAILOVER_CONTINUATION_PROMPT };
+		});
+		return changed ? { messages } : undefined;
+	});
+
 	// Track last user prompt for retry on rotation
 	let lastUserPrompt: string | null = null;
 
-	// Listen for user input to track last prompt
+	// Hidden custom continuations bypass this event, so only normal user turns
+	// replace the captured prompt and initialize a new failover cascade.
 	pi.on("before_agent_start", async (event, ctx) => {
 		lastUserPrompt = event.prompt;
 		poolManager.startTurn(event.prompt, ctx.model);

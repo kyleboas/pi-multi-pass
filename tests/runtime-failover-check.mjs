@@ -78,23 +78,6 @@ function formatFailoverStatus(candidate, fallbackPoolName) {
   return `${scope} | active ${formatFailoverTarget(candidate)}`;
 }
 
-function formatFailoverContinuation(nextCandidate) {
-  if (!nextCandidate) {
-    return "cascade exhausted; no later eligible target";
-  }
-  const phase = nextCandidate.source === "chain"
-    ? `continuing forward to chain ${nextCandidate.chainName}#${(nextCandidate.chainIndex ?? 0) + 1}`
-    : `continuing within pool ${nextCandidate.poolName}`;
-  return `${phase} -> ${formatFailoverTarget(nextCandidate)}`;
-}
-
-function formatFailoverTransition(poolName, currentProvider, nextCandidate) {
-  const phase = nextCandidate.source === "chain"
-    ? `advancing to chain ${nextCandidate.chainName}#${(nextCandidate.chainIndex ?? 0) + 1}`
-    : `rotating within pool ${poolName}`;
-  return `[pool:${poolName}] Rate limited on ${currentProvider}; ${phase}; active ${formatFailoverTarget(nextCandidate)}`;
-}
-
 function formatFailoverExhausted(poolName, currentProvider) {
   return `[pool:${poolName}] Failover exhausted after ${currentProvider}; no eligible target remained in this cascade.`;
 }
@@ -106,6 +89,8 @@ const RATE_LIMIT_PATTERNS = [
   /\bquota[ _-]*(?:exceeded|exhausted)\b/i,
   /\bresource[ _-]*exhausted\b/i,
 ];
+const FAILOVER_CONTINUATION_TYPE = "multi-pass";
+const FAILOVER_CONTINUATION_MARKER = "resume";
 const FAILOVER_CONTINUATION_PROMPT =
   "Continue the interrupted request from the existing conversation context. Do not repeat tool calls or side effects that already completed.";
 
@@ -131,11 +116,10 @@ class RuntimeHarness {
     this.modelCatalog = createModelCatalog();
     this.notifications = [];
     this.statuses = [];
-    this.sentPrompts = [];
-    this.sentPromptOptions = [];
+    this.sentMessages = [];
+    this.sentMessageOptions = [];
     this.setModelCalls = [];
     this.cascadeState = null;
-    this.suppressNextStartTurn = false;
     this.safeContinuationPending = false;
 
     for (const pool of config.pools) {
@@ -168,10 +152,6 @@ class RuntimeHarness {
   }
 
   startTurn(prompt, currentModel) {
-    if (this.suppressNextStartTurn) {
-      this.suppressNextStartTurn = false;
-      return;
-    }
     if (!prompt) {
       this.cascadeState = null;
       return;
@@ -350,9 +330,19 @@ class RuntimeHarness {
     this.statuses.push(value);
   }
 
-  sendUserMessage(prompt, options) {
-    this.sentPrompts.push(prompt);
-    this.sentPromptOptions.push(options);
+  sendMessage(message, options) {
+    this.sentMessages.push(message);
+    this.sentMessageOptions.push(options);
+  }
+
+  expandContinuationContext(messages) {
+    return messages.map((message) =>
+      message.role === "custom" &&
+      message.customType === FAILOVER_CONTINUATION_TYPE &&
+      message.content === FAILOVER_CONTINUATION_MARKER
+        ? { ...message, content: FAILOVER_CONTINUATION_PROMPT }
+        : message,
+    );
   }
 
   async handleError(errorMessage, currentModel, prompt) {
@@ -367,11 +357,6 @@ class RuntimeHarness {
     this.markExhausted(currentModel.provider);
     const plan = this.buildFailoverPlan(currentModel);
 
-    const continuation = formatFailoverContinuation(plan.candidates[0]);
-    for (const skip of plan.skips) {
-      this.notify(`[pool:${skip.poolName}] ${skip.detail}; ${continuation}`, "warning");
-    }
-
     const nextCandidate = plan.candidates[0];
     if (!nextCandidate) {
       this.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
@@ -381,10 +366,6 @@ class RuntimeHarness {
 
     const nextModel = this.findModel(nextCandidate.provider, nextCandidate.modelId);
     if (!nextModel) {
-      this.notify(
-        `[pool:${nextCandidate.poolName}] ${nextCandidate.provider} -> ${nextCandidate.modelId} skipped (model missing at runtime); cascade exhausted; no later eligible target`,
-        "warning",
-      );
       this.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
       this.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
       return false;
@@ -392,10 +373,6 @@ class RuntimeHarness {
 
     const success = await this.setModel(nextModel);
     if (!success) {
-      this.notify(
-        `[pool:${nextCandidate.poolName}] ${nextCandidate.provider} skipped (authentication unavailable during switch); cascade exhausted; no later eligible target`,
-        "warning",
-      );
       this.notify(formatFailoverExhausted(pool.name, currentModel.provider), "warning");
       this.setStatus("multi-pass", formatFailoverStatus(null, pool.name));
       return false;
@@ -406,7 +383,6 @@ class RuntimeHarness {
       cascade.visitedChainIndexes.add(nextCandidate.chainIndex);
     }
 
-    this.notify(formatFailoverTransition(pool.name, currentModel.provider, nextCandidate), "info");
     this.setStatus("multi-pass", formatFailoverStatus(nextCandidate));
     if (prompt) this.safeContinuationPending = true;
     return true;
@@ -419,8 +395,15 @@ class RuntimeHarness {
   settle() {
     if (!this.safeContinuationPending) return;
     this.safeContinuationPending = false;
-    this.suppressNextStartTurn = true;
-    this.sendUserMessage(FAILOVER_CONTINUATION_PROMPT);
+    this.sendMessage(
+      {
+        role: "custom",
+        customType: FAILOVER_CONTINUATION_TYPE,
+        content: FAILOVER_CONTINUATION_MARKER,
+        display: false,
+      },
+      { triggerTurn: true },
+    );
   }
 
   snapshot() {
@@ -428,8 +411,8 @@ class RuntimeHarness {
       attemptedProviders: [...(this.cascadeState?.attemptedProviders || [])],
       visitedChainIndexes: [...(this.cascadeState?.visitedChainIndexes || [])],
       setModelCalls: [...this.setModelCalls],
-      sentPrompts: [...this.sentPrompts],
-      sentPromptOptions: [...this.sentPromptOptions],
+      sentMessages: [...this.sentMessages],
+      sentMessageOptions: [...this.sentMessageOptions],
       safeContinuationPending: this.safeContinuationPending,
       notifications: [...this.notifications],
       statuses: [...this.statuses],
@@ -539,12 +522,9 @@ async function runPoolOnlyChecks() {
 
   const snapshot = harness.snapshot();
   assert.deepEqual(snapshot.setModelCalls, ["anthropic-2:claude-sonnet-4"]);
-  assert.deepEqual(snapshot.sentPrompts, []);
+  assert.deepEqual(snapshot.sentMessages, []);
   assert.equal(snapshot.statuses.at(-1), "pool:primary | active anthropic-2 (claude-sonnet-4)");
-  assert.equal(
-    snapshot.notifications.at(-1).message,
-    "[pool:primary] Rate limited on anthropic; rotating within pool primary; active anthropic-2 (claude-sonnet-4)",
-  );
+  assert.deepEqual(snapshot.notifications, []);
   assert.equal(snapshot.attemptedProviders.includes("anthropic"), true);
   assert.equal(snapshot.attemptedProviders.includes("anthropic-2"), true);
   assert.equal(snapshot.visitedChainIndexes.length, 0);
@@ -597,25 +577,15 @@ async function runNoLoopChecks() {
     "google-gemini-cli:gemini-2.5-pro",
   ]);
   assert.deepEqual(snapshot.visitedChainIndexes, [1, 2]);
-  assert.deepEqual(snapshot.sentPrompts, []);
-
-  const warningMessages = snapshot.notifications
-    .filter((entry) => entry.level === "warning")
-    .map((entry) => entry.message);
-  assert.equal(
-    warningMessages.some((message) => message.includes("anthropic skipped (already attempted this turn)")),
-    true,
-  );
-  assert.equal(
-    warningMessages.some((message) => message.includes("openai-codex skipped (already attempted this turn)")),
-    true,
-  );
+  assert.deepEqual(snapshot.sentMessages, []);
   assert.equal(snapshot.statuses.at(-2), "chain:ordered-fallback#3 | active google-gemini-cli (gemini-2.5-pro)");
   assert.equal(snapshot.statuses.at(-1), "pool:solo | cascade exhausted | no eligible target");
-  assert.equal(
-    snapshot.notifications.find((entry) => entry.level === "info" && entry.message.includes("ordered-fallback#3")).message,
-    "[pool:backup] Rate limited on openai-codex-2; advancing to chain ordered-fallback#3; active google-gemini-cli (gemini-2.5-pro)",
-  );
+  assert.deepEqual(snapshot.notifications, [
+    {
+      message: "[pool:solo] Failover exhausted after google-gemini-cli; no eligible target remained in this cascade.",
+      level: "warning",
+    },
+  ]);
 
   console.log("no-loop checks passed");
 }
@@ -643,20 +613,11 @@ async function runFailurePathChecks() {
 
   assert.deepEqual(
     warningMessages,
-    [
-      "[pool:primary] anthropic-2 skipped (no auth); cascade exhausted; no later eligible target",
-      "[pool:primary] anthropic-3 skipped (no auth); cascade exhausted; no later eligible target",
-      "[pool:disabled-pool] disabled-pool -> claude-sonnet-4 skipped (invalid pool: disabled-pool disabled); cascade exhausted; no later eligible target",
-      "[pool:missing-pool] missing-pool -> claude-sonnet-4 skipped (invalid pool: missing-pool missing); cascade exhausted; no later eligible target",
-      "[pool:backup] backup -> claude-ghost skipped (entry disabled); cascade exhausted; no later eligible target",
-      "[pool:solo] google-gemini-cli skipped (cooldown active); cascade exhausted; no later eligible target",
-      "[pool:solo] solo -> gemini-2.5-pro skipped (no eligible members); cascade exhausted; no later eligible target",
-      "[pool:primary] Failover exhausted after anthropic; no eligible target remained in this cascade.",
-    ],
+    ["[pool:primary] Failover exhausted after anthropic; no eligible target remained in this cascade."],
   );
   assert.deepEqual(snapshot.statuses.at(-1), "pool:primary | cascade exhausted | no eligible target");
   assert.deepEqual(snapshot.setModelCalls, []);
-  assert.deepEqual(snapshot.sentPrompts, []);
+  assert.deepEqual(snapshot.sentMessages, []);
 
   const plannerHarness = new RuntimeHarness(config, ["anthropic", "google-gemini-cli"]);
   plannerHarness.startTurn("debug retries", { provider: "anthropic", id: "claude-sonnet-4" });
@@ -758,13 +719,24 @@ async function runReplayDeliveryChecks() {
 
   assert.equal(rotated, true);
   assert.equal(harness.snapshot().safeContinuationPending, true);
-  assert.deepEqual(harness.snapshot().sentPrompts, []);
+  assert.deepEqual(harness.snapshot().sentMessages, []);
 
   harness.settle();
   const snapshot = harness.snapshot();
-  assert.deepEqual(snapshot.sentPrompts, [FAILOVER_CONTINUATION_PROMPT]);
-  assert.equal(snapshot.sentPrompts.includes(prompt), false);
-  assert.deepEqual(snapshot.sentPromptOptions, [undefined]);
+  assert.deepEqual(snapshot.sentMessages, [
+    {
+      role: "custom",
+      customType: FAILOVER_CONTINUATION_TYPE,
+      content: FAILOVER_CONTINUATION_MARKER,
+      display: false,
+    },
+  ]);
+  assert.deepEqual(snapshot.sentMessageOptions, [{ triggerTurn: true }]);
+  assert.equal(snapshot.sentMessages[0].content.includes(prompt), false);
+  assert.equal(
+    harness.expandContinuationContext(snapshot.sentMessages)[0].content,
+    FAILOVER_CONTINUATION_PROMPT,
+  );
 
   const retryHarness = new RuntimeHarness(config, ["anthropic", "anthropic-2"]);
   retryHarness.startTurn(prompt, { provider: "anthropic", id: "claude-sonnet-4" });
@@ -775,7 +747,7 @@ async function runReplayDeliveryChecks() {
   ), true);
   retryHarness.finishSuccessfulTurn();
   retryHarness.settle();
-  assert.deepEqual(retryHarness.snapshot().sentPrompts, []);
+  assert.deepEqual(retryHarness.snapshot().sentMessages, []);
 
   console.log("settled-continuation checks passed");
 }
