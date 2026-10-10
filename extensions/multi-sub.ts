@@ -2321,6 +2321,16 @@ function isRateLimitError(errorMessage: string): boolean {
 	return parseHttpStatus(errorMessage) === 429 || RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(errorMessage));
 }
 
+// Codex plans differ in which models they offer (e.g. a lower plan lacks
+// gpt-6-astra). Another pool member may offer it, so fail over instead of stopping.
+function isUnsupportedModelError(errorMessage: string): boolean {
+	return /\bmodel is not supported\b/i.test(errorMessage);
+}
+
+function isFailoverError(errorMessage: string): boolean {
+	return isRateLimitError(errorMessage) || isUnsupportedModelError(errorMessage);
+}
+
 const FAILOVER_CONTINUATION_TYPE = "multi-pass";
 const FAILOVER_CONTINUATION_MARKER = "resume";
 const FAILOVER_CONTINUATION_PROMPT =
@@ -3092,7 +3102,7 @@ class PoolManager {
 		config: MultiPassConfig,
 	): Promise<boolean> {
 		if (!currentModel) return false;
-		if (!isRateLimitError(errorMessage)) return false;
+		if (!isFailoverError(errorMessage)) return false;
 
 		const pool = this.getPoolForProvider(currentModel.provider);
 		if (!pool) return false;
