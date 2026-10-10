@@ -107,6 +107,14 @@ function isRateLimitError(errorMessage) {
   return parseHttpStatus(errorMessage) === 429 || RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(errorMessage));
 }
 
+function isUnsupportedModelError(errorMessage) {
+  return /\bmodel is not supported\b/i.test(errorMessage);
+}
+
+function isFailoverError(errorMessage) {
+  return isRateLimitError(errorMessage) || isUnsupportedModelError(errorMessage);
+}
+
 class RuntimeHarness {
   constructor(config, authenticatedProviders) {
     this.config = config;
@@ -348,7 +356,7 @@ class RuntimeHarness {
   async handleError(errorMessage, currentModel, prompt) {
     this.safeContinuationPending = false;
     if (!currentModel) return false;
-    if (!isRateLimitError(errorMessage)) return false;
+    if (!isFailoverError(errorMessage)) return false;
 
     const pool = this.getPoolForProvider(currentModel.provider);
     if (!pool) return false;
@@ -532,6 +540,24 @@ async function runPoolOnlyChecks() {
   console.log("pool-only checks passed");
 }
 
+async function runUnsupportedModelChecks() {
+  const config = createConfig();
+  config.chains = [];
+  const harness = new RuntimeHarness(config, ["anthropic", "anthropic-2", "anthropic-3"]);
+  const prompt = "summarize incident";
+  const unsupported = `{"detail":"The 'claude-sonnet-4' model is not supported when using Codex with a ChatGPT account."}`;
+
+  harness.startTurn(prompt, { provider: "anthropic", id: "claude-sonnet-4" });
+  const rotated = await harness.handleError(unsupported, { provider: "anthropic", id: "claude-sonnet-4" }, prompt);
+  assert.equal(rotated, true);
+  assert.deepEqual(harness.snapshot().setModelCalls, ["anthropic-2:claude-sonnet-4"]);
+
+  const unrelated = await harness.handleError("400 bad request", { provider: "anthropic-2", id: "claude-sonnet-4" }, prompt);
+  assert.equal(unrelated, false);
+
+  console.log("unsupported-model failover checks passed");
+}
+
 async function runNoLoopChecks() {
   const config = createConfig();
   const harness = new RuntimeHarness(config, [
@@ -702,6 +728,12 @@ function runRateLimitMatcherChecks() {
   ]) {
     assert.equal(isRateLimitError(message), false, message);
   }
+  assert.equal(
+    isFailoverError(`{"detail":"The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."}`),
+    true,
+  );
+  assert.equal(isRateLimitError(`{"detail":"The 'gpt-6-astra' model is not supported when using Codex with a ChatGPT account."}`), false);
+  assert.equal(isFailoverError("HTTP 400 bad request"), false);
   console.log("rate-limit matcher checks passed");
 }
 
@@ -790,6 +822,7 @@ async function runRetryStartTurnChecks() {
 runCoreChecks();
 runSessionStatusChecks();
 runRateLimitMatcherChecks();
+await runUnsupportedModelChecks();
 await runReplayDeliveryChecks();
 
 if (process.argv.includes("--retry-start-turn")) {
